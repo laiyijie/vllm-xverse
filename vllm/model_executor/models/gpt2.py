@@ -32,12 +32,13 @@ from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention import PagedAttention
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.weight_utils import (
-    hf_model_weights_iterator, load_padded_tensor_parallel_vocab,
-    load_tensor_parallel_weights)
+    convert_pyslice_to_tensor, hf_model_weights_iterator,
+    load_padded_tensor_parallel_vocab, load_tensor_parallel_weights)
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
-from vllm.model_executor.parallel_utils.tensor_parallel import (
-    VocabParallelEmbedding, ColumnParallelLinear, RowParallelLinear)
+from vllm.model_executor.parallel_utils.layers import (VocabParallelEmbedding,
+                                                       ColumnParallelLinear,
+                                                       RowParallelLinear)
 from vllm.sequence import SamplerOutput
 
 KVCache = Tuple[torch.Tensor, torch.Tensor]
@@ -56,16 +57,18 @@ class GPT2Attention(nn.Module):
         self.head_dim = self.hidden_size // total_num_heads
         self.scale = self.head_dim**-0.5
 
-        self.c_attn = ColumnParallelLinear(self.hidden_size,
-                                           3 * self.hidden_size,
-                                           bias=True,
-                                           gather_output=False,
-                                           perform_initialization=False)
-        self.c_proj = RowParallelLinear(self.hidden_size,
-                                        self.hidden_size,
-                                        bias=True,
-                                        input_is_parallel=True,
-                                        perform_initialization=False)
+        self.c_attn = ColumnParallelLinear(
+            self.hidden_size,
+            3 * self.hidden_size,
+            bias=True,
+            gather_output=False,
+        )
+        self.c_proj = RowParallelLinear(
+            self.hidden_size,
+            self.hidden_size,
+            bias=True,
+            input_is_parallel=True,
+        )
         self.attn = PagedAttention(self.num_heads,
                                    self.head_dim,
                                    scale=self.scale)
@@ -95,16 +98,18 @@ class GPT2MLP(nn.Module):
     ):
         super().__init__()
         hidden_size = config.hidden_size
-        self.c_fc = ColumnParallelLinear(hidden_size,
-                                         intermediate_size,
-                                         bias=True,
-                                         gather_output=False,
-                                         perform_initialization=False)
-        self.c_proj = RowParallelLinear(intermediate_size,
-                                        hidden_size,
-                                        bias=True,
-                                        input_is_parallel=True,
-                                        perform_initialization=False)
+        self.c_fc = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=True,
+            gather_output=False,
+        )
+        self.c_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=True,
+            input_is_parallel=True,
+        )
         self.act = get_act_fn(config.activation_function)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
@@ -231,14 +236,15 @@ class GPT2LMHeadModel(nn.Module):
     def load_weights(self,
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
-                     use_np_cache: bool = False):
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
         tensor_model_parallel_world_size = (
             get_tensor_model_parallel_world_size())
         tensor_model_parallel_rank = get_tensor_model_parallel_rank()
         state_dict = self.state_dict()
 
         for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, use_np_cache):
+                model_name_or_path, cache_dir, load_format, revision):
             if "lm_head.weight" in name:
                 # GPT-2 ties the weights of the embedding layer and the final
                 # linear layer.
@@ -250,6 +256,8 @@ class GPT2LMHeadModel(nn.Module):
 
             if not name.startswith("transformer."):
                 name = "transformer." + name
+
+            loaded_weight = convert_pyslice_to_tensor(loaded_weight)
 
             # The HF's GPT-2 implementation uses Conv1D instead of Linear.
             # Because of this, we need to transpose the weights.

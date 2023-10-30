@@ -10,12 +10,14 @@ from vllm.model_executor.input_metadata import InputMetadata
 from vllm.model_executor.layers.activation import get_act_fn
 from vllm.model_executor.layers.attention import PagedAttentionWithALiBi
 from vllm.model_executor.layers.sampler import Sampler
-from vllm.model_executor.weight_utils import (hf_model_weights_iterator,
+from vllm.model_executor.weight_utils import (convert_pyslice_to_tensor,
+                                              hf_model_weights_iterator,
                                               load_tensor_parallel_weights)
 from vllm.model_executor.parallel_utils.parallel_state import (
     get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size)
-from vllm.model_executor.parallel_utils.tensor_parallel import (
-    VocabParallelEmbedding, ColumnParallelLinear, RowParallelLinear)
+from vllm.model_executor.parallel_utils.layers import (VocabParallelEmbedding,
+                                                       ColumnParallelLinear,
+                                                       RowParallelLinear)
 from vllm.sequence import SamplerOutput
 from vllm.transformers_utils.configs.mpt import MPTConfig
 
@@ -52,7 +54,6 @@ class MPTAttention(nn.Module):
             3 * self.d_model,
             bias=not config.no_bias,
             gather_output=False,
-            perform_initialization=False,
         )
         if self.qk_ln:
             self.q_ln = nn.LayerNorm(self.d_model)
@@ -62,7 +63,6 @@ class MPTAttention(nn.Module):
             self.d_model,
             bias=not config.no_bias,
             input_is_parallel=True,
-            perform_initialization=False,
         )
 
         tp_world_size = get_tensor_model_parallel_world_size()
@@ -112,17 +112,19 @@ class MPTMLP(nn.Module):
         hidden_size = config.d_model
         expansion_ratio = config.expansion_ratio
         intermediate_size = expansion_ratio * hidden_size
-        self.up_proj = ColumnParallelLinear(hidden_size,
-                                            intermediate_size,
-                                            bias=not config.no_bias,
-                                            gather_output=False,
-                                            perform_initialization=False)
+        self.up_proj = ColumnParallelLinear(
+            hidden_size,
+            intermediate_size,
+            bias=not config.no_bias,
+            gather_output=False,
+        )
         self.act = get_act_fn("gelu")
-        self.down_proj = RowParallelLinear(intermediate_size,
-                                           hidden_size,
-                                           bias=not config.no_bias,
-                                           input_is_parallel=True,
-                                           perform_initialization=False)
+        self.down_proj = RowParallelLinear(
+            intermediate_size,
+            hidden_size,
+            bias=not config.no_bias,
+            input_is_parallel=True,
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x, _ = self.up_proj(x)
@@ -171,9 +173,10 @@ class MPTModel(nn.Module):
         assert config.embedding_fraction == 1.0
         assert config.norm_type == "low_precision_layernorm"
 
-        self.wte = VocabParallelEmbedding(config.vocab_size,
-                                          config.d_model,
-                                          perform_initialization=False)
+        self.wte = VocabParallelEmbedding(
+            config.vocab_size,
+            config.d_model,
+        )
         self.blocks = nn.ModuleList(
             [MPTBlock(config) for _ in range(config.n_layers)])
         self.norm_f = nn.LayerNorm(config.d_model)
@@ -243,12 +246,13 @@ class MPTForCausalLM(nn.Module):
     def load_weights(self,
                      model_name_or_path: str,
                      cache_dir: Optional[str] = None,
-                     use_np_cache: bool = False):
+                     load_format: str = "auto",
+                     revision: Optional[str] = None):
         tp_world_size = get_tensor_model_parallel_world_size()
         tp_rank = get_tensor_model_parallel_rank()
         state_dict = self.state_dict()
         for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, use_np_cache):
+                model_name_or_path, cache_dir, load_format, revision):
             if "Wqkv" in name:
                 # NOTE(woosuk): MPT's fused QKV has the shape of
                 # [3 * num_heads * head_size, hidden_size].
@@ -260,7 +264,7 @@ class MPTForCausalLM(nn.Module):
                 num_heads = total_num_heads // tp_world_size
                 head_start = tp_rank * num_heads
                 head_end = (tp_rank + 1) * num_heads
-
+                loaded_weight = convert_pyslice_to_tensor(loaded_weight)
                 if name.endswith(".weight"):
                     loaded_weight = loaded_weight.view(3, total_num_heads,
                                                        head_size, hidden_size)
