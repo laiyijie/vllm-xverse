@@ -64,13 +64,11 @@ class XverseMLP(nn.Module):
         self.gate_up_proj = ColumnParallelLinear(hidden_size,
                                                  2 * intermediate_size,
                                                  bias=False,
-                                                 gather_output=False,
-                                                 perform_initialization=False)
+                                                 gather_output=False)
         self.down_proj = RowParallelLinear(intermediate_size,
                                            hidden_size,
                                            bias=False,
-                                           input_is_parallel=True,
-                                           perform_initialization=False)
+                                           input_is_parallel=True)
         if hidden_act != "silu":
             raise ValueError(f"Unsupported activation: {hidden_act}. "
                              "Only silu is supported for now.")
@@ -106,14 +104,12 @@ class XverseAttention(nn.Module):
             3 * hidden_size,
             bias=False,
             gather_output=False,
-            perform_initialization=False,
         )
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             hidden_size,
             bias=False,
             input_is_parallel=True,
-            perform_initialization=False,
         )
         self.attn = PagedAttentionWithRoPE(self.num_heads,
                                            self.head_dim,
@@ -197,7 +193,7 @@ class XverseModel(nn.Module):
 
         vocab_size = ((config.vocab_size + 63) // 64) * 64
         self.embed_tokens = VocabParallelEmbedding(
-            vocab_size, config.hidden_size, perform_initialization=False)
+            vocab_size, config.hidden_size)
         self.layers = nn.ModuleList([
             XverseDecoderLayer(config) for _ in range(config.num_hidden_layers)
         ])
@@ -239,8 +235,7 @@ class XverseForCausalLM(nn.Module):
         self.lm_head = ColumnParallelLinear(config.hidden_size,
                                             vocab_size,
                                             bias=False,
-                                            gather_output=False,
-                                            perform_initialization=False)
+                                            gather_output=False)
         self.sampler = Sampler(config.vocab_size)
 
     def forward(
